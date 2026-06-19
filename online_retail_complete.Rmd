@@ -1,0 +1,1691 @@
+---
+title: "Online Retail Customer Analytics"
+author: "Retail Analytics Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: false
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(forecast)
+library(tidyr)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(plotly)
+```
+
+---
+
+## Executive Summary
+
+This project analyzes online retail transaction data to understand revenue patterns, customer behavior, transaction anomalies, and future sales trends. The dataset covers transactions from December 2010 to December 2011 and contains 541,909 rows across 38 countries. The main goal is to support better customer retention, marketing, and revenue planning decisions.
+
+---
+
+## Business Problem
+
+Online retailers collect large amounts of transaction data, but this data is only useful when it is converted into business insight. This project asks how an online retailer can identify valuable customers, detect unusual transactions, forecast revenue, and make better marketing decisions.
+
+---
+
+## Data Import
+
+```{r import-data, echo=TRUE}
+retail <- read_excel("C:/Users/aksta/Desktop/onlineretail/Online Retail.xlsx")
+head(retail)
+str(retail)
+summary(retail)
+```
+
+---
+
+## Data Cleaning and Preparation
+
+```{r clean-data}
+retail <- retail %>%
+  rename(
+    invoice_no   = InvoiceNo,
+    stock_code   = StockCode,
+    description  = Description,
+    quantity     = Quantity,
+    invoice_date = InvoiceDate,
+    unit_price   = UnitPrice,
+    customer_id  = CustomerID,
+    country      = Country
+  ) %>%
+  mutate(
+    invoice_date = as.POSIXct(invoice_date),
+    date         = as.Date(invoice_date),
+    month        = month(date, label = TRUE, abbr = FALSE),
+    month_year   = format(date, "%B %Y"),
+    weekday      = wday(date, label = TRUE, abbr = FALSE),
+    revenue      = quantity * unit_price,
+    country      = case_when(
+      country == "EIRE" ~ "Ireland",
+      TRUE ~ country
+    )
+  )
+```
+
+---
+
+## Missing Values
+
+```{r missing-values}
+missing_summary <- retail %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "missing_count") %>%
+  mutate(
+    missing_percent = round((missing_count / nrow(retail)) * 100, 2),
+    missing_status  = case_when(
+      missing_count == 0        ~ "No Missing",
+      missing_percent < 5       ~ "Low Missing",
+      missing_percent < 20      ~ "Moderate Missing",
+      TRUE                      ~ "High Missing"
+    )
+  ) %>%
+  arrange(desc(missing_count))
+
+missing_summary %>%
+  kable(
+    caption   = "Missing Value Summary",
+    col.names = c("Variable", "Missing Count", "Missing Percent (%)", "Missing Status"),
+    align     = "lccc",
+    digits    = 2
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    position          = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, color = "white",
+              background = ifelse(missing_summary$missing_count > 0, "#D9534F", "#5CB85C")) %>%
+  column_spec(3, color = "white",
+              background = ifelse(missing_summary$missing_percent > 20, "#D9534F",
+                           ifelse(missing_summary$missing_percent > 5,  "#F0AD4E", "#5CB85C"))) %>%
+  column_spec(4, bold = TRUE, color = "white",
+              background = ifelse(missing_summary$missing_status == "High Missing",     "#D9534F",
+                           ifelse(missing_summary$missing_status == "Moderate Missing","#F0AD4E",
+                           ifelse(missing_summary$missing_status == "Low Missing",     "#5BC0DE", "#5CB85C"))))
+```
+
+> **Missing Value Insight:** CustomerID is missing for 24.9% of all transactions. These records cannot be used for customer-level analysis such as RFM segmentation and were excluded from the clean business dataset. All other variables are complete.
+
+---
+
+## Clean Business Dataset
+
+```{r clean-business-data}
+retail_clean <- retail %>%
+  filter(
+    !is.na(customer_id),
+    quantity   > 0,
+    unit_price > 0,
+    revenue    > 0
+  )
+```
+
+```{r define-negative-quantity}
+negative_quantity <- retail %>%
+  filter(quantity < 0) %>%
+  mutate(month_year = format(as.Date(invoice_date), "%B %Y"))
+```
+
+---
+
+## Descriptive Analysis
+
+### Key Business Indicators
+
+```{r kpi-summary}
+kpi_summary <- retail_clean %>%
+  summarise(
+    total_revenue          = sum(revenue, na.rm = TRUE),
+    total_orders           = n_distinct(invoice_no),
+    unique_customers       = n_distinct(customer_id),
+    unique_products        = n_distinct(stock_code),
+    average_order_value    = total_revenue / total_orders,
+    average_customer_value = total_revenue / unique_customers
+  )
+
+kpi_summary %>%
+  mutate(
+    total_revenue          = dollar(total_revenue),
+    total_orders           = comma(total_orders),
+    unique_customers       = comma(unique_customers),
+    unique_products        = comma(unique_products),
+    average_order_value    = dollar(average_order_value),
+    average_customer_value = dollar(average_customer_value)
+  ) %>%
+  kable(
+    caption   = "Key Business Performance Indicators",
+    col.names = c("Total Revenue","Total Orders","Unique Customers",
+                  "Unique Products","Average Order Value","Average Customer Value"),
+    align     = "cccccc"
+  ) %>%
+  kable_styling(
+    full_width        = TRUE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 14
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(1, bold = TRUE, background = "#F8F9FA") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(2, bold = TRUE, background = "#E9F5F2") %>%
+  column_spec(3, bold = TRUE, background = "#E9F5F2") %>%
+  column_spec(4, bold = TRUE, background = "#E9F5F2") %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#F4A261") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+### General ID Structure Audit
+
+```{r invoice-stock-structure-audit}
+id_structure_audit <- tibble(
+  Metric = c(
+    "Total Rows","Unique Invoices","Unique Stock Codes",
+    "Unique Customers","Average Rows per Invoice","Average Invoices per Customer"
+  ),
+  Value = c(
+    nrow(retail),
+    n_distinct(retail$invoice_no),
+    n_distinct(retail$stock_code),
+    n_distinct(retail$customer_id, na.rm = TRUE),
+    nrow(retail) / n_distinct(retail$invoice_no),
+    n_distinct(retail$invoice_no) / n_distinct(retail$customer_id, na.rm = TRUE)
+  ),
+  Business_Meaning = c(
+    "Total transaction lines in the raw dataset",
+    "Number of unique invoice numbers",
+    "Number of unique product identifiers",
+    "Number of identifiable customers",
+    "Shows that one invoice usually contains multiple product lines",
+    "Shows average invoice activity per identifiable customer"
+  )
+) %>%
+  mutate(
+    Value = ifelse(
+      Metric %in% c("Average Rows per Invoice","Average Invoices per Customer"),
+      round(as.numeric(Value), 2),
+      comma(as.numeric(Value))
+    )
+  )
+
+id_structure_audit %>%
+  kable(
+    caption   = "Invoice and Stock Code Structure Audit",
+    col.names = c("Metric","Value","Business Meaning"),
+    align     = "lcl"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2C3E50", width = "4cm") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F", width = "3cm") %>%
+  column_spec(3, width = "8cm")
+```
+
+### Monthly Revenue Trend
+
+```{r monthly-revenue}
+monthly_revenue <- retail_clean %>%
+  group_by(month_year) %>%
+  summarise(
+    revenue   = sum(revenue, na.rm = TRUE),
+    orders    = n_distinct(invoice_no),
+    customers = n_distinct(customer_id),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    month_year_date = as.Date(paste("01", month_year), format = "%d %B %Y"),
+    revenue_label   = label_number(scale_cut = cut_short_scale(), accuracy = 0.1)(revenue)
+  ) %>%
+  arrange(month_year_date)
+
+max_month <- monthly_revenue %>% filter(revenue == max(revenue, na.rm = TRUE))
+min_month <- monthly_revenue %>% filter(revenue == min(revenue, na.rm = TRUE))
+
+ggplot(monthly_revenue, aes(x = month_year_date, y = revenue)) +
+  geom_line(linewidth = 1.2, color = "#2C3E50") +
+  geom_point(size = 3.5, color = "#2C3E50") +
+  geom_point(data = max_month, aes(x = month_year_date, y = revenue),
+             size = 4.5, color = "#2A9D8F") +
+  geom_point(data = min_month, aes(x = month_year_date, y = revenue),
+             size = 4.5, color = "#E76F51") +
+  geom_text(aes(label = revenue_label), vjust = -1, size = 3.3, color = "#222222") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0.08, 0.18))
+  ) +
+  scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 month") +
+  labs(
+    title    = "Monthly Revenue Trend",
+    subtitle = "Valid customer transactions aggregated by month",
+    x = "Month", y = "Revenue",
+    caption  = "Note: Green point = highest-revenue month; red point = lowest-revenue month."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 17),
+    plot.subtitle      = element_text(size = 12, color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+### Monthly Revenue Detailed Table
+
+```{r monthly-revenue-table}
+monthly_median_revenue <- median(monthly_revenue$revenue, na.rm = TRUE)
+
+monthly_revenue_table <- monthly_revenue %>%
+  mutate(
+    month_label          = format(month_year_date, "%b %Y"),
+    revenue_per_order    = revenue / orders,
+    revenue_per_customer = revenue / customers,
+    revenue_status       = case_when(
+      revenue == max(revenue, na.rm = TRUE) ~ "Highest Month",
+      revenue == min(revenue, na.rm = TRUE) ~ "Lowest Month",
+      revenue >= monthly_median_revenue     ~ "Above Median",
+      TRUE                                  ~ "Below Median"
+    )
+  ) %>%
+  select(
+    Month                = month_label,
+    Revenue              = revenue,
+    Orders               = orders,
+    Customers            = customers,
+    `Revenue per Order`  = revenue_per_order,
+    `Revenue per Customer` = revenue_per_customer,
+    `Month Status`       = revenue_status
+  )
+
+monthly_revenue_table %>%
+  mutate(
+    Revenue              = dollar(Revenue),
+    Orders               = comma(Orders),
+    Customers            = comma(Customers),
+    `Revenue per Order`  = dollar(`Revenue per Order`),
+    `Revenue per Customer` = dollar(`Revenue per Customer`)
+  ) %>%
+  kable(caption = "Monthly Revenue Performance Summary", align = "lcccccc") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, width = "3cm") %>%
+  column_spec(2, bold = TRUE, width = "3cm") %>%
+  column_spec(7, bold = TRUE, color = "white",
+              background = ifelse(monthly_revenue_table$`Month Status` == "Highest Month", "#2A9D8F",
+                           ifelse(monthly_revenue_table$`Month Status` == "Lowest Month",  "#E76F51",
+                           ifelse(monthly_revenue_table$`Month Status` == "Above Median",  "#457B9D", "#6C757D"))))
+```
+
+### Monthly Revenue Summary Statistics
+
+```{r monthly-summary-stats}
+tibble(
+  Metric = c("Total Revenue","Average Monthly Revenue","Median Monthly Revenue",
+             "Highest Monthly Revenue","Lowest Monthly Revenue","Number of Months"),
+  Value  = c(
+    dollar(sum(monthly_revenue$revenue, na.rm = TRUE)),
+    dollar(mean(monthly_revenue$revenue, na.rm = TRUE)),
+    dollar(median(monthly_revenue$revenue, na.rm = TRUE)),
+    dollar(max(monthly_revenue$revenue, na.rm = TRUE)),
+    dollar(min(monthly_revenue$revenue, na.rm = TRUE)),
+    comma(nrow(monthly_revenue))
+  )
+) %>%
+  kable(caption = "Monthly Revenue Summary Statistics", align = "lc") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 14
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, width = "5cm") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F", width = "4cm")
+```
+
+> **Monthly Revenue Insight:** Revenue grew consistently throughout 2011, with a sharp acceleration in the final quarter. September to November alone accounted for nearly 40% of full-year revenue, driven by early Christmas purchasing patterns typical in UK retail. February recorded the lowest monthly revenue at $447K, reflecting the post-holiday demand slowdown. The strong upward trend from August onwards confirms clear seasonal demand momentum heading into year-end.
+
+### Top 10 Countries by Revenue
+
+```{r top-countries}
+total_company_revenue <- sum(retail_clean$revenue, na.rm = TRUE)
+
+top_countries <- retail_clean %>%
+  group_by(country) %>%
+  summarise(
+    revenue   = sum(revenue, na.rm = TRUE),
+    orders    = n_distinct(invoice_no),
+    customers = n_distinct(customer_id),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(revenue)) %>%
+  slice_head(n = 10) %>%
+  mutate(
+    revenue_percent = revenue / total_company_revenue,
+    label = paste0(
+      dollar(revenue, accuracy = 0.1, scale_cut = cut_short_scale()),
+      " | ", percent(revenue_percent, accuracy = 0.1)
+    )
+  )
+
+ggplot(top_countries, aes(x = reorder(country, revenue), y = revenue)) +
+  geom_col(fill = "#2C3E50") +
+  geom_text(aes(label = label), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title    = "Top 10 Countries by Revenue",
+    subtitle = "Revenue contribution and percentage share of total company revenue",
+    x = "Country", y = "Revenue"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    axis.title         = element_text(face = "bold"),
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+### Top 10 Products by Revenue
+
+```{r top-products-data}
+top_products <- retail_clean %>%
+  group_by(stock_code, description) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(revenue)) %>%
+  slice_head(n = 10) %>%
+  mutate(
+    product_label = paste0(stock_code, ": ", str_trunc(description, 30)),
+    revenue_pct   = revenue / sum(retail_clean$revenue, na.rm = TRUE),
+    label = paste0(
+      dollar(revenue, accuracy = 0.1, scale_cut = cut_short_scale()),
+      " | ", percent(revenue_pct, accuracy = 0.1)
+    )
+  )
+```
+
+```{r top-products-chart}
+ggplot(top_products, aes(x = reorder(product_label, revenue), y = revenue)) +
+  geom_col(fill = "#2C3E50", width = 0.75) +
+  geom_text(aes(label = label), hjust = -0.08, size = 3.5, color = "#222222") +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.35))
+  ) +
+  labs(
+    title    = "Top 10 Products by Revenue",
+    subtitle = "Product-level revenue contribution based on valid customer transactions",
+    x = "Product", y = "Revenue",
+    caption  = stringr::str_wrap(
+      "Note: Percentages represent each product's share of total company revenue.",
+      width = 85)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.y        = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(10, 70, 25, 10)
+  )
+```
+
+---
+
+## Customer Analytics
+
+### RFM Summary Table
+
+```{r rfm-summary}
+reference_date <- max(retail_clean$date) + 1
+
+rfm <- retail_clean %>%
+  group_by(customer_id) %>%
+  summarise(
+    recency   = as.numeric(reference_date - max(date)),
+    frequency = n_distinct(invoice_no),
+    monetary  = sum(revenue, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+tibble(
+  Metric  = c("Recency","Frequency","Monetary"),
+  Meaning = c(
+    "Days since the customer's last purchase",
+    "Number of unique orders made by the customer",
+    "Total revenue generated by the customer"
+  ),
+  Minimum = c(min(rfm$recency), min(rfm$frequency), min(rfm$monetary)),
+  Median  = c(median(rfm$recency), median(rfm$frequency), median(rfm$monetary)),
+  Average = c(mean(rfm$recency), mean(rfm$frequency), mean(rfm$monetary)),
+  Maximum = c(max(rfm$recency), max(rfm$frequency), max(rfm$monetary))
+) %>%
+  mutate(
+    Minimum = case_when(Metric == "Monetary" ~ dollar(Minimum), TRUE ~ comma(Minimum, accuracy = 0.1)),
+    Median  = case_when(Metric == "Monetary" ~ dollar(Median),  TRUE ~ comma(Median,  accuracy = 0.1)),
+    Average = case_when(Metric == "Monetary" ~ dollar(Average), TRUE ~ comma(Average, accuracy = 0.1)),
+    Maximum = case_when(Metric == "Monetary" ~ dollar(Maximum), TRUE ~ comma(Maximum, accuracy = 0.1))
+  ) %>%
+  kable(
+    caption   = "RFM Summary Statistics",
+    col.names = c("RFM Metric","Business Meaning","Minimum","Median","Average","Maximum"),
+    align     = "llcccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2C3E50", width = "3cm") %>%
+  column_spec(2, width = "7cm") %>%
+  column_spec(4, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(5, bold = TRUE, background = "#E9F5F2") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+### RFM Customer Segmentation
+
+```{r rfm-segmentation}
+rfm <- rfm %>%
+  mutate(
+    r_score          = ntile(-recency, 5),
+    f_score          = ntile(frequency, 5),
+    m_score          = ntile(monetary, 5),
+    rfm_score        = r_score + f_score + m_score,
+    customer_segment = case_when(
+      rfm_score >= 13 ~ "High Value",
+      rfm_score >= 9  ~ "Medium Value",
+      TRUE            ~ "Low Value"
+    )
+  )
+
+segment_summary <- rfm %>%
+  group_by(customer_segment) %>%
+  summarise(
+    customer_count = n(),
+    avg_recency    = mean(recency),
+    avg_frequency  = mean(frequency),
+    avg_monetary   = mean(monetary),
+    total_monetary = sum(monetary),
+    .groups        = "drop"
+  )
+
+segment_summary %>%
+  mutate(
+    customer_percent = customer_count / sum(customer_count),
+    revenue_percent  = total_monetary / sum(total_monetary),
+    avg_recency      = round(avg_recency, 1),
+    avg_frequency    = round(avg_frequency, 1),
+    avg_monetary     = dollar(avg_monetary),
+    total_monetary   = dollar(total_monetary),
+    customer_count   = comma(customer_count),
+    customer_percent = percent(customer_percent, accuracy = 0.1),
+    revenue_percent  = percent(revenue_percent, accuracy = 0.1)
+  ) %>%
+  select(
+    `Customer Segment`   = customer_segment,
+    `Customer Count`     = customer_count,
+    `Customer Share`     = customer_percent,
+    `Avg Recency Days`   = avg_recency,
+    `Avg Frequency`      = avg_frequency,
+    `Avg Monetary Value` = avg_monetary,
+    `Total Revenue`      = total_monetary,
+    `Revenue Share`      = revenue_percent
+  ) %>%
+  kable(caption = "RFM Customer Segment Summary", align = "lccccccc") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white",
+              background = ifelse(segment_summary$customer_segment == "High Value",   "#2A9D8F",
+                           ifelse(segment_summary$customer_segment == "Medium Value", "#457B9D", "#6C757D"))) %>%
+  column_spec(2, bold = TRUE, width = "3cm") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#F4A261") %>%
+  column_spec(7, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(8, bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+### Customer Segment Distribution
+
+```{r customer-segment-chart}
+segment_chart_data <- segment_summary %>%
+  mutate(
+    customer_percent = customer_count / sum(customer_count),
+    customer_label   = paste0(comma(customer_count), " | ", percent(customer_percent, accuracy = 0.1)),
+    customer_segment = factor(customer_segment, levels = c("Low Value","Medium Value","High Value"))
+  )
+
+ggplot(segment_chart_data, aes(x = customer_segment, y = customer_count)) +
+  geom_col(fill = "#2C3E50", width = 0.65) +
+  geom_text(aes(label = customer_label), vjust = -0.5, size = 4,
+            fontface = "bold", color = "#222222") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "Customer Segment Distribution",
+    subtitle = "RFM-based customer groups with count and percentage share",
+    x = "Customer Segment", y = "Number of Customers",
+    caption  = "Note: Segments were created using RFM scores based on recency, frequency, and monetary value."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+> **RFM Insight:** The segmentation reveals a classic 80/20 pattern. High Value customers represent only 21.3% of the customer base but contribute 70% of total revenue ($6.2M out of $8.9M). Low Value customers make up 47.7% of customers but generate only 10% of revenue. This concentration means retaining even a small number of High Value customers has an outsized impact on total business performance. These customers should be prioritised for loyalty programs, early access offers, and personalised outreach.
+
+---
+
+## Marketing Analytics
+
+### Churn Risk Classification
+
+```{r churn-risk}
+churn_risk <- rfm %>%
+  mutate(
+    churn_risk = case_when(
+      recency <= 30  ~ "Active",
+      recency <= 90  ~ "At Risk",
+      recency <= 180 ~ "Lapsing",
+      TRUE           ~ "Churned"
+    )
+  ) %>%
+  group_by(churn_risk) %>%
+  summarise(
+    customers     = n(),
+    avg_monetary  = mean(monetary),
+    total_revenue = sum(monetary),
+    avg_recency   = mean(recency),
+    .groups       = "drop"
+  ) %>%
+  mutate(
+    pct_customers = customers / sum(customers),
+    pct_revenue   = total_revenue / sum(total_revenue),
+    churn_risk    = factor(churn_risk,
+                           levels = c("Active","At Risk","Lapsing","Churned"))
+  ) %>%
+  arrange(churn_risk)
+
+churn_risk %>%
+  mutate(
+    Customers      = comma(customers),
+    `Customer Share` = percent(pct_customers, accuracy = 0.1),
+    `Avg Recency (Days)` = round(avg_recency, 0),
+    `Avg Monetary Value` = dollar(avg_monetary),
+    `Total Revenue` = dollar(total_revenue),
+    `Revenue Share` = percent(pct_revenue, accuracy = 0.1)
+  ) %>%
+  select(
+    `Churn Risk`   = churn_risk,
+    Customers,
+    `Customer Share`,
+    `Avg Recency (Days)`,
+    `Avg Monetary Value`,
+    `Total Revenue`,
+    `Revenue Share`
+  ) %>%
+  kable(
+    caption = "Customer Churn Risk Classification",
+    align   = "lcccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white",
+              background = ifelse(churn_risk$churn_risk == "Active",   "#2A9D8F",
+                           ifelse(churn_risk$churn_risk == "At Risk",  "#F4A261",
+                           ifelse(churn_risk$churn_risk == "Lapsing",  "#E76F51", "#2C3E50")))) %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+### Churn Risk Distribution Chart
+
+```{r churn-risk-chart}
+ggplot(churn_risk, aes(x = churn_risk, y = customers, fill = churn_risk)) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = paste0(comma(customers), " | ", percent(pct_customers, accuracy = 0.1))),
+    vjust = -0.5, size = 4, fontface = "bold", color = "#222222"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Active"  = "#2A9D8F",
+      "At Risk" = "#F4A261",
+      "Lapsing" = "#E76F51",
+      "Churned" = "#2C3E50"
+    )
+  ) +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "Customer Churn Risk Distribution",
+    subtitle = "Customers classified by days since last purchase",
+    x        = "Churn Risk Category",
+    y        = "Number of Customers",
+    caption  = stringr::str_wrap(
+      "Active = last purchase within 30 days. At Risk = 31-90 days. Lapsing = 91-180 days. Churned = more than 180 days since last purchase.",
+      width = 95)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(face = "bold"),
+    legend.position    = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+> **Churn Risk Insight:** The churn risk analysis reveals how urgently different customer groups need attention. Active customers (last purchase within 30 days) are the safest group and should be maintained through loyalty programmes. At Risk and Lapsing customers represent recoverable revenue - these are customers who have purchased before but are drifting away. A targeted re-engagement campaign with a personalised incentive, sent within the next 30 days, could recover a meaningful share of this revenue before these customers fully churn.
+
+### Top Products by Customer Segment
+
+```{r product-segment-analysis}
+product_segment <- retail_clean %>%
+  inner_join(rfm %>% select(customer_id, customer_segment),
+             by = "customer_id") %>%
+  group_by(customer_segment, stock_code, description) %>%
+  summarise(
+    revenue   = sum(revenue, na.rm = TRUE),
+    orders    = n_distinct(invoice_no),
+    customers = n_distinct(customer_id),
+    .groups   = "drop"
+  ) %>%
+  group_by(customer_segment) %>%
+  slice_max(order_by = revenue, n = 5) %>%
+  ungroup() %>%
+  mutate(
+    customer_segment = factor(customer_segment,
+                              levels = c("High Value","Medium Value","Low Value")),
+    description = str_trunc(description, 35)
+  )
+
+product_segment %>%
+  mutate(
+    Revenue   = dollar(revenue),
+    Orders    = comma(orders),
+    Customers = comma(customers)
+  ) %>%
+  select(
+    `Customer Segment` = customer_segment,
+    `Stock Code`       = stock_code,
+    `Product`          = description,
+    Revenue,
+    Orders,
+    Customers
+  ) %>%
+  kable(
+    caption = "Top 5 Products by Revenue for Each Customer Segment",
+    align   = "llllcc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white",
+              background = ifelse(product_segment$customer_segment == "High Value",   "#2A9D8F",
+                           ifelse(product_segment$customer_segment == "Medium Value", "#457B9D", "#6C757D"))) %>%
+  column_spec(4, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+> **Product-Segment Insight:** Connecting RFM segments to product preferences reveals which products drive value for each customer group. High Value customers tend to purchase in larger volumes and across a broader product range. Understanding which products attract High Value customers allows the business to promote those products more aggressively as acquisition tools - bringing in customers who are likely to become high spenders.
+
+### International Market Opportunity
+
+```{r country-efficiency}
+country_efficiency <- retail_clean %>%
+  group_by(country) %>%
+  summarise(
+    revenue              = sum(revenue, na.rm = TRUE),
+    orders               = n_distinct(invoice_no),
+    customers            = n_distinct(customer_id),
+    revenue_per_customer = revenue / customers,
+    orders_per_customer  = orders / customers,
+    avg_order_value      = revenue / orders,
+    .groups              = "drop"
+  ) %>%
+  filter(customers >= 10) %>%
+  arrange(desc(revenue_per_customer)) %>%
+  slice_head(n = 10)
+
+country_efficiency %>%
+  mutate(
+    Revenue              = dollar(revenue),
+    Customers            = comma(customers),
+    Orders               = comma(orders),
+    `Revenue per Customer` = dollar(revenue_per_customer),
+    `Orders per Customer`  = round(orders_per_customer, 1),
+    `Avg Order Value`      = dollar(avg_order_value)
+  ) %>%
+  select(
+    Country = country,
+    Revenue,
+    Customers,
+    Orders,
+    `Revenue per Customer`,
+    `Orders per Customer`,
+    `Avg Order Value`
+  ) %>%
+  kable(
+    caption = "International Market Efficiency - Top 10 Countries by Revenue per Customer",
+    align   = "lcccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(7, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+> **International Insight:** Ranking countries by revenue-per-customer rather than total revenue reveals which markets are most efficient. A country with fewer customers but high revenue-per-customer is a high-quality market worth investing in. This analysis identifies where increased marketing spend would yield the highest return, and which markets represent underdeveloped opportunities relative to their potential.
+
+---
+
+## Anomaly / Data Quality Analysis
+
+### Duplicate Invoice and Stock Code Check
+
+```{r duplicate-check}
+duplicate_invoice_stock <- retail %>%
+  group_by(invoice_no, stock_code) %>%
+  summarise(
+    line_count           = n(),
+    total_quantity       = sum(quantity, na.rm = TRUE),
+    total_revenue        = sum(revenue, na.rm = TRUE),
+    product_descriptions = paste(unique(description), collapse = "; "),
+    .groups              = "drop"
+  ) %>%
+  filter(line_count > 1) %>%
+  arrange(desc(line_count))
+
+tibble(
+  Metric = c(
+    "Duplicate Invoice-Stock Combinations",
+    "Highest Repeated Lines in One Invoice-Product Pair"
+  ),
+  Value = c(
+    nrow(duplicate_invoice_stock),
+    ifelse(nrow(duplicate_invoice_stock) > 0, max(duplicate_invoice_stock$line_count), 0)
+  )
+) %>%
+  kable(caption = "Duplicate Invoice and Stock Code Check", align = "lc") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, width = "6cm") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#E76F51", width = "3cm")
+```
+
+### Missing Customer IDs
+
+```{r missing-customer-ids}
+missing_customer <- retail %>%
+  mutate(
+    customer_id_status = ifelse(is.na(customer_id), "Missing Customer ID", "Available Customer ID")
+  ) %>%
+  group_by(customer_id_status) %>%
+  summarise(
+    transaction_count = n(),
+    total_revenue     = sum(revenue, na.rm = TRUE),
+    .groups           = "drop"
+  ) %>%
+  mutate(
+    transaction_percent = transaction_count / sum(transaction_count),
+    revenue_percent     = total_revenue / sum(total_revenue),
+    label = paste0(comma(transaction_count), " transactions | ",
+                   percent(transaction_percent, accuracy = 0.1))
+  )
+
+ggplot(missing_customer, aes(x = customer_id_status, y = transaction_count)) +
+  geom_col(fill = "#2C3E50", width = 0.6) +
+  geom_text(aes(label = label), vjust = -0.5, size = 4, fontface = "bold") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "Transactions With and Without Customer ID",
+    subtitle = "Customer ID availability as a data quality issue",
+    x = "Customer ID Status", y = "Number of Transactions",
+    caption  = "Note: Missing customer IDs cannot be used for RFM segmentation."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+### Negative Quantity and Returns
+
+```{r negative-quantity-summary}
+negative_summary <- negative_quantity %>%
+  summarise(
+    negative_transaction_count = n(),
+    unique_invoices            = n_distinct(invoice_no),
+    total_negative_quantity    = sum(quantity, na.rm = TRUE),
+    estimated_return_value     = sum(revenue, na.rm = TRUE),
+    absolute_return_value      = sum(abs(revenue), na.rm = TRUE)
+  )
+
+negative_summary %>%
+  mutate(
+    negative_transaction_count = comma(negative_transaction_count),
+    unique_invoices            = comma(unique_invoices),
+    total_negative_quantity    = comma(total_negative_quantity),
+    estimated_return_value     = dollar(estimated_return_value),
+    absolute_return_value      = dollar(absolute_return_value)
+  ) %>%
+  kable(
+    caption   = "Negative Quantity and Return Transaction Summary",
+    col.names = c("Negative Transactions","Unique Invoices","Total Negative Quantity",
+                  "Estimated Return Value","Absolute Return Value"),
+    align     = "ccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(1, bold = TRUE, background = "#F8F9FA") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(4, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+### Monthly Returns and Cancellations
+
+```{r returns-by-month-chart}
+returns_by_month <- negative_quantity %>%
+  group_by(month_year) %>%
+  summarise(
+    return_transactions    = n(),
+    unique_return_invoices = n_distinct(invoice_no),
+    total_negative_quantity= sum(quantity, na.rm = TRUE),
+    return_value           = sum(abs(revenue), na.rm = TRUE),
+    .groups                = "drop"
+  ) %>%
+  mutate(
+    month_year_date = as.Date(paste("01", month_year), format = "%d %B %Y"),
+    return_label    = paste0(
+      comma(return_transactions), " | ",
+      dollar(return_value, accuracy = 0.1, scale_cut = cut_short_scale())
+    )
+  ) %>%
+  arrange(month_year_date)
+
+ggplot(returns_by_month, aes(x = month_year_date, y = return_transactions)) +
+  geom_line(linewidth = 1.2, color = "#2C3E50") +
+  geom_point(size = 3.5, color = "#E76F51") +
+  geom_text(aes(label = return_label), vjust = -0.8, size = 3.2,
+            fontface = "bold", color = "#222222") +
+  scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 month") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0.05, 0.25))
+  ) +
+  labs(
+    title    = "Monthly Return and Cancellation Transactions",
+    subtitle = "Monthly count of negative-quantity transactions and estimated return value",
+    x = "Month", y = "Return / Cancellation Transactions",
+    caption  = stringr::str_wrap(
+      "Note: Negative quantities are treated as return or cancellation behavior. These records were separated from clean positive sales analysis.",
+      width = 95)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(size = 9),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(10, 70, 25, 10)
+  )
+```
+
+```{r returns-by-month-table}
+returns_by_month %>%
+  mutate(
+    Month                    = format(month_year_date, "%b %Y"),
+    `Return Transactions`    = comma(return_transactions),
+    `Unique Return Invoices` = comma(unique_return_invoices),
+    `Total Negative Quantity`= comma(total_negative_quantity),
+    `Estimated Return Value` = dollar(return_value)
+  ) %>%
+  select(Month, `Return Transactions`, `Unique Return Invoices`,
+         `Total Negative Quantity`, `Estimated Return Value`) %>%
+  kable(caption = "Monthly Return and Cancellation Summary", align = "lcccc") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, width = "3cm") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+> **Returns Insight:** Return transactions peaked in October and November 2011, coinciding with the highest sales months. This is expected behaviour in retail - higher order volumes naturally produce more returns. December 2011 shows a disproportionately high return value ($205K) relative to its transaction count (390), suggesting some large-value order reversals occurred at year-end that warrant further investigation.
+
+### Extreme Invoice Value Audit
+
+Extreme invoice values were reviewed as a data quality and business outlier investigation. A high invoice value is not automatically a data error. Large invoices may represent valid bulk purchases, wholesale customers, or distributors.
+
+#### Step 1: Create Invoice-Level Dataset
+
+```{r extreme-invoice-values}
+invoice_values <- retail_clean %>%
+  group_by(invoice_no) %>%
+  summarise(
+    invoice_value          = sum(revenue, na.rm = TRUE),
+    total_items            = sum(quantity, na.rm = TRUE),
+    product_lines          = n(),
+    unique_products        = n_distinct(stock_code),
+    customer_id            = first(customer_id),
+    country                = first(country),
+    invoice_date           = min(date),
+    implied_price_per_item = invoice_value / total_items,
+    .groups                = "drop"
+  )
+
+threshold_99  <- quantile(invoice_values$invoice_value, 0.99,  na.rm = TRUE)
+threshold_999 <- quantile(invoice_values$invoice_value, 0.999, na.rm = TRUE)
+
+extreme_orders <- invoice_values %>%
+  filter(invoice_value >= threshold_99) %>%
+  arrange(desc(invoice_value)) %>%
+  mutate(
+    review_flag = case_when(
+      implied_price_per_item > 1000 ~ "Review: Very High Implied Unit Price",
+      total_items > 50000           ~ "Review: Extremely High Quantity",
+      invoice_value >= threshold_999~ "Review: Top 0.1% Invoice Value",
+      TRUE                          ~ "Likely Business Outlier"
+    )
+  )
+
+extreme_orders %>%
+  slice_head(n = 10) %>%
+  mutate(
+    invoice_value          = dollar(invoice_value),
+    total_items            = comma(total_items),
+    product_lines          = comma(product_lines),
+    unique_products        = comma(unique_products),
+    implied_price_per_item = dollar(implied_price_per_item)
+  ) %>%
+  kable(
+    caption   = "Top Extreme Invoice Values with Initial Review Flags",
+    col.names = c("Invoice No","Invoice Value","Total Items","Product Lines",
+                  "Unique Products","Customer ID","Country","Invoice Date",
+                  "Implied Price per Item","Review Flag"),
+    align     = "lccccccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(9, bold = TRUE, color = "white", background = "#2C3E50") %>%
+  column_spec(10, bold = TRUE, width = "5cm")
+```
+
+#### Step 2: Visualize Top Extreme Invoices
+
+```{r extreme-invoice-chart}
+extreme_invoice_chart <- extreme_orders %>%
+  slice_head(n = 10) %>%
+  mutate(
+    invoice_label = paste0("Invoice ", invoice_no),
+    label = paste0(
+      dollar(invoice_value, accuracy = 0.1, scale_cut = cut_short_scale()),
+      " | ", comma(total_items), " items"
+    )
+  )
+
+ggplot(extreme_invoice_chart, aes(x = reorder(invoice_label, invoice_value), y = invoice_value)) +
+  geom_col(fill = "#2C3E50", width = 0.7) +
+  geom_text(aes(label = label), hjust = -0.08, size = 3.5, fontface = "bold", color = "#222222") +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0, 0.35))
+  ) +
+  labs(
+    title    = "Top 10 Extreme Invoice Values",
+    subtitle = "Extreme invoices audited before being treated as errors or valid business outliers",
+    x = "Invoice Number", y = "Invoice Value",
+    caption  = stringr::str_wrap(
+      "Note: Extreme invoice values are not automatically data errors. Each invoice was reviewed using quantity, implied unit price, customer ID, product details, and return behavior.",
+      width = 95)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30"),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.y        = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(10, 90, 25, 10)
+  )
+```
+
+#### Step 3: Product-Level Audit
+
+```{r extreme-invoice-product-audit}
+top_extreme_invoice_ids <- extreme_orders %>% slice_head(n = 10) %>% pull(invoice_no)
+
+retail_clean %>%
+  filter(invoice_no %in% top_extreme_invoice_ids) %>%
+  mutate(line_revenue = quantity * unit_price) %>%
+  group_by(invoice_no, stock_code, description) %>%
+  summarise(
+    quantity       = sum(quantity, na.rm = TRUE),
+    avg_unit_price = mean(unit_price, na.rm = TRUE),
+    line_revenue   = sum(line_revenue, na.rm = TRUE),
+    .groups        = "drop"
+  ) %>%
+  arrange(invoice_no, desc(line_revenue)) %>%
+  group_by(invoice_no) %>%
+  slice_max(order_by = line_revenue, n = 5) %>%
+  ungroup() %>%
+  mutate(
+    quantity       = comma(quantity),
+    avg_unit_price = dollar(avg_unit_price),
+    line_revenue   = dollar(line_revenue),
+    description    = stringr::str_wrap(description, width = 35)
+  ) %>%
+  kable(
+    caption   = "Product-Level Review of Extreme Invoices: Top Product Lines",
+    col.names = c("Invoice No","Stock Code","Product Description",
+                  "Quantity","Average Unit Price","Line Revenue"),
+    align     = "lllccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2C3E50") %>%
+  column_spec(3, width = "7cm") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#E76F51")
+```
+
+#### Step 4: Customer-Level Audit
+
+```{r extreme-invoice-customer-audit}
+retail_clean %>%
+  filter(customer_id %in% extreme_orders$customer_id) %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_customer_revenue = sum(revenue, na.rm = TRUE),
+    total_orders           = n_distinct(invoice_no),
+    total_items            = sum(quantity, na.rm = TRUE),
+    avg_order_value        = total_customer_revenue / total_orders,
+    first_purchase         = min(date),
+    last_purchase          = max(date),
+    countries              = paste(unique(country), collapse = "; "),
+    .groups                = "drop"
+  ) %>%
+  arrange(desc(total_customer_revenue)) %>%
+  mutate(
+    total_customer_revenue = dollar(total_customer_revenue),
+    total_orders           = comma(total_orders),
+    total_items            = comma(total_items),
+    avg_order_value        = dollar(avg_order_value)
+  ) %>%
+  kable(
+    caption   = "Customer Review for Extreme Invoice Accounts",
+    col.names = c("Customer ID","Total Customer Revenue","Total Orders","Total Items",
+                  "Average Order Value","First Purchase","Last Purchase","Countries"),
+    align     = "lccccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+#### Step 5: Return Behavior Review
+
+```{r extreme-customer-return-check}
+retail %>%
+  filter(customer_id %in% extreme_orders$customer_id) %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_transactions    = n(),
+    positive_transactions = sum(quantity > 0, na.rm = TRUE),
+    return_transactions   = sum(quantity < 0, na.rm = TRUE),
+    return_rate           = return_transactions / total_transactions,
+    positive_revenue      = sum(revenue[quantity > 0], na.rm = TRUE),
+    return_value          = sum(abs(revenue[quantity < 0]), na.rm = TRUE),
+    return_value_rate     = return_value / positive_revenue,
+    .groups               = "drop"
+  ) %>%
+  arrange(desc(return_value_rate)) %>%
+  mutate(
+    total_transactions    = comma(total_transactions),
+    positive_transactions = comma(positive_transactions),
+    return_transactions   = comma(return_transactions),
+    return_rate           = percent(return_rate, accuracy = 0.1),
+    positive_revenue      = dollar(positive_revenue),
+    return_value          = dollar(return_value),
+    return_value_rate     = percent(return_value_rate, accuracy = 0.1)
+  ) %>%
+  kable(
+    caption   = "Return Behavior Review for Extreme Invoice Customers",
+    col.names = c("Customer ID","Total Transactions","Positive Transactions",
+                  "Return Transactions","Return Transaction Rate",
+                  "Positive Revenue","Return Value","Return Value Rate"),
+    align     = "lccccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#E76F51") %>%
+  column_spec(8, bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+> **Extreme Invoice Insight:** Two customers (12346 and 16446) show 100% return value rates, meaning their entire purchase value was subsequently returned. Customer 12346 placed only one order ($77K) which was fully reversed, suggesting a cancelled bulk order rather than a genuine sale. These records should be flagged for commercial review before being included in revenue reporting.
+
+---
+
+## Forecasting / Modeling
+
+```{r forecast-setup}
+dataset_start <- min(retail_clean$date, na.rm = TRUE)
+dataset_end   <- max(retail_clean$date, na.rm = TRUE)
+
+monthly_completeness <- retail_clean %>%
+  group_by(month_year) %>%
+  summarise(
+    first_transaction_date = min(date, na.rm = TRUE),
+    last_transaction_date  = max(date, na.rm = TRUE),
+    transaction_days       = n_distinct(date),
+    transaction_count      = n(),
+    revenue                = sum(revenue, na.rm = TRUE),
+    orders                 = n_distinct(invoice_no),
+    customers              = n_distinct(customer_id),
+    .groups                = "drop"
+  ) %>%
+  mutate(
+    month_year_date    = as.Date(paste("01", month_year), format = "%d %B %Y"),
+    calendar_month_end = ceiling_date(month_year_date, "month") - days(1),
+    month_status       = case_when(
+      month_year_date == floor_date(dataset_start, "month") ~ "Incomplete Start Month",
+      month_year_date == floor_date(dataset_end,   "month") ~ "Incomplete End Month",
+      TRUE                                                   ~ "Complete Month"
+    )
+  ) %>%
+  arrange(month_year_date)
+
+monthly_forecast_clean <- monthly_completeness %>%
+  filter(month_status == "Complete Month") %>%
+  arrange(month_year_date)
+
+monthly_revenue_ts <- ts(
+  monthly_forecast_clean$revenue,
+  start     = c(year(min(monthly_forecast_clean$month_year_date)),
+                month(min(monthly_forecast_clean$month_year_date))),
+  frequency = 12
+)
+```
+
+### Monthly Data Completeness Check
+
+```{r monthly-completeness-check}
+monthly_completeness %>%
+  mutate(
+    Month     = format(month_year_date, "%b %Y"),
+    Revenue   = dollar(revenue),
+    Orders    = comma(orders),
+    Customers = comma(customers)
+  ) %>%
+  select(Month, Revenue, Orders, Customers, transaction_days, month_status) %>%
+  kable(
+    caption   = "Monthly Data Completeness Check",
+    col.names = c("Month","Revenue","Orders","Customers","Transaction Days","Status"),
+    align     = "lccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(6, bold = TRUE, color = "white",
+              background = ifelse(monthly_completeness$month_status == "Complete Month",
+                                  "#2A9D8F", "#E76F51"))
+```
+
+> **Data Note:** December 2010 is flagged as an incomplete start month because the dataset begins on 1 December 2010 and does not represent the full month. December 2011 is incomplete as it only covers the first 9 days. Both months were excluded from model training to avoid distorting the trend. Only the 11 complete months from January to November 2011 were used for forecasting.
+
+### Monthly Forecast - Holt Damped ETS Model
+
+```{r monthly-holt-model}
+monthly_holt <- holt(
+  monthly_revenue_ts,
+  h       = 3,
+  damped  = TRUE,
+  level   = c(80, 95),
+  initial = "optimal"
+)
+
+holt_resids <- residuals(monthly_holt)
+holt_mae    <- mean(abs(holt_resids))
+holt_rmse   <- sqrt(mean(holt_resids^2))
+holt_mape   <- mean(abs(holt_resids / monthly_forecast_clean$revenue)) * 100
+
+tibble(
+  Metric  = c("MAE","RMSE","MAPE"),
+  Value   = c(dollar(holt_mae), dollar(holt_rmse), paste0(round(holt_mape, 1), "%")),
+  Meaning = c(
+    "Average absolute forecast error in pounds",
+    "Root mean squared error - penalises large errors more",
+    "Mean absolute percentage error - lower is better"
+  )
+) %>%
+  kable(caption = "Holt Damped ETS - Model Accuracy Metrics", align = "lll") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2C3E50") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(3, width = "9cm")
+```
+
+### Monthly Forecast Table - Holt Damped ETS
+
+```{r monthly-holt-forecast-table}
+future_months <- seq.Date(
+  from       = max(monthly_forecast_clean$month_year_date) %m+% months(1),
+  by         = "month",
+  length.out = 3
+)
+
+holt_forecast_table <- tibble(
+  Month    = format(future_months, "%b %Y"),
+  Forecast = as.numeric(monthly_holt$mean),
+  Lo_80    = as.numeric(monthly_holt$lower[, 1]),
+  Hi_80    = as.numeric(monthly_holt$upper[, 1]),
+  Lo_95    = as.numeric(monthly_holt$lower[, 2]),
+  Hi_95    = as.numeric(monthly_holt$upper[, 2])
+)
+
+holt_forecast_table %>%
+  mutate(across(where(is.numeric), dollar)) %>%
+  kable(
+    caption   = "3-Month Revenue Forecast - Holt Damped ETS",
+    col.names = c("Month","Point Forecast","Lo 80%","Hi 80%","Lo 95%","Hi 95%"),
+    align     = "lccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(5:6, color = "white", background = "#E76F51")
+```
+
+### Monthly Forecast Chart - Holt Damped ETS
+
+```{r monthly-holt-forecast-chart}
+historical_monthly <- monthly_forecast_clean %>%
+  transmute(date = month_year_date, revenue = revenue)
+
+forecast_monthly <- tibble(
+  date    = future_months,
+  revenue = as.numeric(monthly_holt$mean),
+  lo95    = as.numeric(monthly_holt$lower[, 2]),
+  hi95    = as.numeric(monthly_holt$upper[, 2]),
+  lo80    = as.numeric(monthly_holt$lower[, 1]),
+  hi80    = as.numeric(monthly_holt$upper[, 1])
+)
+
+ggplot() +
+  geom_ribbon(data = forecast_monthly, aes(x = date, ymin = lo95, ymax = hi95),
+              fill = "#E76F51", alpha = 0.15) +
+  geom_ribbon(data = forecast_monthly, aes(x = date, ymin = lo80, ymax = hi80),
+              fill = "#E76F51", alpha = 0.25) +
+  geom_line(data = historical_monthly, aes(x = date, y = revenue),
+            color = "#2C3E50", linewidth = 1.2) +
+  geom_point(data = historical_monthly, aes(x = date, y = revenue),
+             color = "#2C3E50", size = 3) +
+  geom_line(data = forecast_monthly, aes(x = date, y = revenue),
+            color = "#E76F51", linewidth = 1.2, linetype = "dashed") +
+  geom_point(data = forecast_monthly, aes(x = date, y = revenue),
+             color = "#E76F51", size = 3.5) +
+  geom_text(data = forecast_monthly,
+            aes(x = date, y = revenue,
+                label = dollar(revenue, accuracy = 1, scale_cut = cut_short_scale())),
+            vjust = -1, size = 3.5, fontface = "bold", color = "#E76F51") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0.08, 0.22))
+  ) +
+  scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 month") +
+  labs(
+    title    = "Monthly Revenue Forecast - Holt Damped ETS",
+    subtitle = "Dark band = 80% CI, Light band = 95% CI | 3-month horizon",
+    x = "Month", y = "Revenue",
+    caption  = stringr::str_wrap(
+      "Model: Holt Damped Exponential Smoothing. Trained on 11 complete months (Jan-Nov 2011). Damping prevents overconfident trend extrapolation. No seasonality modelled - insufficient data for seasonal estimation with one year of history.",
+      width = 100)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30", size = 11),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(size = 9),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin        = margin(10, 70, 25, 10)
+  )
+```
+
+### Polynomial Regression Model (Degree 2)
+
+```{r polynomial-regression-model}
+poly_data <- monthly_forecast_clean %>%
+  arrange(month_year_date) %>%
+  mutate(month_index = row_number())
+
+poly_model  <- lm(revenue ~ poly(month_index, 2, raw = TRUE), data = poly_data)
+poly_resids <- residuals(poly_model)
+poly_r2     <- summary(poly_model)$r.squared
+poly_mae    <- mean(abs(poly_resids))
+poly_rmse   <- sqrt(mean(poly_resids^2))
+poly_mape   <- mean(abs(poly_resids / poly_data$revenue)) * 100
+
+tibble(
+  Metric  = c("R-Squared","MAE","RMSE","MAPE"),
+  Value   = c(
+    round(poly_r2, 3),
+    dollar(poly_mae),
+    dollar(poly_rmse),
+    paste0(round(poly_mape, 1), "%")
+  ),
+  Meaning = c(
+    "Proportion of revenue variation explained by the curve (0 to 1, higher is better)",
+    "Average absolute forecast error in pounds",
+    "Root mean squared error - penalises large errors more",
+    "Mean absolute percentage error - lower is better"
+  )
+) %>%
+  kable(caption = "Polynomial Regression (Degree 2) - Model Accuracy Metrics", align = "lll") %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE, color = "white", background = "#2C3E50") %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(3, width = "9cm")
+```
+
+### Polynomial Regression Forecast Table
+
+```{r polynomial-regression-forecast-table}
+future_months_poly <- seq.Date(
+  from       = max(monthly_forecast_clean$month_year_date) %m+% months(1),
+  by         = "month",
+  length.out = 3
+)
+
+future_index_poly <- data.frame(month_index = max(poly_data$month_index) + 1:3)
+poly_pred_95      <- predict(poly_model, newdata = future_index_poly,
+                             interval = "prediction", level = 0.95)
+poly_pred_80      <- predict(poly_model, newdata = future_index_poly,
+                             interval = "prediction", level = 0.80)
+
+tibble(
+  Month    = format(future_months_poly, "%b %Y"),
+  Forecast = poly_pred_95[, "fit"],
+  Lo_80    = poly_pred_80[, "lwr"],
+  Hi_80    = poly_pred_80[, "upr"],
+  Lo_95    = poly_pred_95[, "lwr"],
+  Hi_95    = poly_pred_95[, "upr"]
+) %>%
+  mutate(across(where(is.numeric), dollar)) %>%
+  kable(
+    caption   = "3-Month Revenue Forecast - Polynomial Regression (Degree 2)",
+    col.names = c("Month","Point Forecast","Lo 80%","Hi 80%","Lo 95%","Hi 95%"),
+    align     = "lccccc"
+  ) %>%
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped","hover","condensed","responsive"),
+    position          = "center",
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2A9D8F") %>%
+  column_spec(5:6, color = "white", background = "#E76F51")
+```
+
+### Polynomial Regression Forecast Chart
+
+```{r polynomial-regression-forecast-chart}
+poly_historical <- poly_data %>%
+  mutate(fitted_val = fitted(poly_model)) %>%
+  select(date = month_year_date, revenue, fitted_val)
+
+poly_plot_forecast <- tibble(
+  date     = future_months_poly,
+  forecast = poly_pred_95[, "fit"],
+  lo95     = poly_pred_95[, "lwr"],
+  hi95     = poly_pred_95[, "upr"],
+  lo80     = poly_pred_80[, "lwr"],
+  hi80     = poly_pred_80[, "upr"]
+)
+
+ggplot() +
+  geom_ribbon(data = poly_plot_forecast, aes(x = date, ymin = lo95, ymax = hi95),
+              fill = "#E76F51", alpha = 0.15) +
+  geom_ribbon(data = poly_plot_forecast, aes(x = date, ymin = lo80, ymax = hi80),
+              fill = "#E76F51", alpha = 0.25) +
+  geom_line(data = poly_historical, aes(x = date, y = fitted_val),
+            color = "#457B9D", linewidth = 1, linetype = "dotted") +
+  geom_line(data = poly_historical, aes(x = date, y = revenue),
+            color = "#2C3E50", linewidth = 1.2) +
+  geom_point(data = poly_historical, aes(x = date, y = revenue),
+             color = "#2C3E50", size = 3) +
+  geom_line(data = poly_plot_forecast, aes(x = date, y = forecast),
+            color = "#E76F51", linewidth = 1.2, linetype = "dashed") +
+  geom_point(data = poly_plot_forecast, aes(x = date, y = forecast),
+             color = "#E76F51", size = 3.5) +
+  geom_text(data = poly_plot_forecast,
+            aes(x = date, y = forecast,
+                label = dollar(forecast, accuracy = 1, scale_cut = cut_short_scale())),
+            vjust = -1, size = 3.5, fontface = "bold", color = "#E76F51") +
+  scale_y_continuous(
+    labels = label_number(scale_cut = cut_short_scale()),
+    expand = expansion(mult = c(0.08, 0.25))
+  ) +
+  scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 month") +
+  labs(
+    title    = "Monthly Revenue Forecast - Polynomial Regression (Degree 2)",
+    subtitle = "Dotted blue = fitted curve | Dashed orange = forecast | Dark band = 80% CI, Light band = 95% CI",
+    x = "Month", y = "Revenue",
+    caption  = stringr::str_wrap(
+      "Model: Degree-2 Polynomial Regression on month index (1 to 11). R-squared = 0.889, explaining 88.9% of monthly revenue variation. MAPE = 10.4%. Degree 2 was selected over degree 3 to avoid overfitting on 11 observations.",
+      width = 100)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(color = "gray30", size = 11),
+    plot.caption       = element_text(size = 10, color = "gray40", hjust = 0),
+    axis.title         = element_text(face = "bold"),
+    axis.text.x        = element_text(size = 9),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin        = margin(10, 70, 25, 10)
+  )
+```
+
+> **Forecast Model Comparison:** Two models were used to forecast the next 3 months of revenue. The Holt Damped ETS model (MAPE 17.3%) applies exponential smoothing with a damped trend, meaning it gradually slows the growth projection to avoid overconfidence. It forecasts December 2011 at approximately $1.16M. The Polynomial Regression model (MAPE 10.4%, R-squared 0.889) fits a curved trend line to the data and captures the accelerating growth observed in Q4 2011 more precisely. It forecasts December 2011 at $1.33M. The difference between the two models ($172K) reflects a genuine disagreement about how much of the Q4 acceleration is a sustained trend versus a seasonal spike. Given its stronger accuracy metrics, the Polynomial model is the preferred forecast, but both should be treated as directional planning estimates rather than precise targets given the limited 11-month training window.
+
+---
+
+## Business Recommendations
+
+The analysis produces five clear, data-driven business priorities:
+
+**1. Protect High Value Customers - Immediate Priority**
+
+Only 926 customers (21.3%) generate 70% of total revenue ($6.2M). Their average recency is 15 days, meaning they are still actively purchasing. Losing even a small number would have an outsized revenue impact. Action: Launch a VIP loyalty programme immediately with personalised communication, early product access, and proactive account management.
+
+**2. Re-engage At Risk and Lapsing Customers - Revenue Recovery**
+
+The churn risk analysis identifies customers with 31-180 days since their last purchase. These are customers with a proven purchase history who are drifting away. A targeted re-engagement campaign with a personalised incentive, delivered within the next 30 days, offers the highest short-term revenue recovery opportunity. Action: Segment by recency bucket and send tailored offers - the At Risk group should receive a softer nudge while the Lapsing group needs a stronger incentive.
+
+**3. Leverage Product-Segment Intelligence for Marketing**
+
+The product-by-segment analysis reveals which products drive revenue for each customer group. High Value customers purchase a broader and higher-value product range. Action: Use the top products of High Value customers as featured products in acquisition campaigns - customers who buy these products first are more likely to become high-value customers over time.
+
+**4. Expand International Marketing in High-Efficiency Markets**
+
+The international efficiency analysis shows that certain countries generate disproportionately high revenue-per-customer relative to their current size. These are not saturated markets but high-quality ones. Action: Increase marketing spend in the top-ranked countries by revenue-per-customer. These markets offer the best return on international marketing investment.
+
+**5. Fix Customer Data Capture**
+
+24.9% of all transactions have no Customer ID, creating a permanent blind spot. Every unidentified customer is unretainable, unsegmentable, and unanalysable. Action: Implement mandatory account creation or loyalty card registration at checkout. Estimated impact: recovering analytics visibility over approximately 135,000 transactions per year.
+
+---
+
+## Limitations
+
+This dataset does not include customer demographics, advertising campaigns, website behaviour, or profit margins. The project focuses on transaction behaviour rather than full customer psychology or profitability. Both forecast models are trained on only 11 complete months and should be treated as directional estimates rather than precise predictions. The absence of a second year of data means seasonal patterns cannot be formally estimated or validated.
+
+---
+
+## Future Work
+
+Future improvements could include customer lifetime value modelling using BG/NBD or Pareto/NBD frameworks, churn prediction using logistic regression or survival analysis, product recommendation systems based on basket co-occurrence, and an interactive Power BI or Shiny dashboard for ongoing monitoring.
